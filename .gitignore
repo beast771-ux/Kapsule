@@ -1,0 +1,10 @@
+# Build
+kapsule
+*.o
+
+# Runtime directories
+container_work/
+rootfs/
+
+# OS junk
+.DS_Store
