@@ -15,12 +15,13 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/resource.h> // REQUIRED FOR rlimit
 #include <fcntl.h>
 #include <ftw.h>
 #include <time.h>
 #include <limits.h>
 
-// Shared Enums and Structs from your architecture [cite: 232-254]
+// Shared Enums and Structs
 typedef enum { CREATED, MODIFIED, DELETED } ChangeType;
 
 typedef struct {
@@ -44,7 +45,7 @@ typedef struct {
     double sleep_ratio;
     int timebomb_flag;
     int threat_score;
-    char verdict[32];
+    char verdict[64];
 } ResourceStats;
 
 // Global Data Collection Arrays
@@ -63,6 +64,7 @@ extern struct timespec start_time;
 // Function prototypes
 int child_payload(void *arg);
 void setup_cgroups();
+void add_pid_to_cgroup(pid_t pid);
 void read_cgroup_stats();
 void setup_filesystem();
 void audit_filesystem();
