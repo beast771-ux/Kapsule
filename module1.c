@@ -6,23 +6,28 @@ struct timespec start_time;
 
 int child_payload(void *arg) {
     (void)arg;
-    // sethostname: Set container hostname to 'kapsule'
     sethostname("kapsule", 7);
     setup_filesystem();
     
+    // HARD FAILSAFE: Prevent host swap thrashing if cgroup limits fail
+    struct rlimit mem_limit;
+    mem_limit.rlim_cur = 100 * 1024 * 1024; // 100 MB Limit
+    mem_limit.rlim_max = 100 * 1024 * 1024;
+    if (setrlimit(RLIMIT_AS, &mem_limit) != 0) {
+        perror("setrlimit failed");
+    }
+
     // Tell parent we are ready to be traced
     ptrace(PTRACE_TRACEME, 0, NULL, NULL);
     raise(SIGSTOP); // Pause so parent can attach
 
     char *args[] = {"/bin/sh", NULL};
-    // execve: Spawn new binary launched
     execve("/bin/sh", args, NULL);
     
     perror("execve failed");
     return EXIT_FAILURE;
 }
 
-// Helper to get time elapsed in seconds
 double get_elapsed_time() {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -34,26 +39,21 @@ void start_ptrace_monitor(pid_t child_pid) {
     long total_sleep_usec = 0;
     
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    
-    // Wait for child to raise SIGSTOP
     waitpid(child_pid, &status, 0);
     
-    // FIX: Trace all forks/clones so scripts and external commands cannot evade the sandbox
     ptrace(PTRACE_SETOPTIONS, child_pid, 0, 
            PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | 
            PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE);
 
-    // State tracker to distinguish between Syscall Entry and Syscall Exit for multiple processes
     pid_t traced_pids[1024];
     int in_syscall[1024] = {0};
+    struct timespec syscall_entry_time[1024]; // Track exact entry time per PID
     int pid_count = 1;
     traced_pids[0] = child_pid;
 
-    // Resume the initial child process so it can execute /bin/sh
     ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
 
     while (1) {
-        // Wait for ANY traced process in the container
         pid_t pid = waitpid(-1, &status, __WALL);
         if (pid == -1) {
             if (errno == ECHILD) break;
@@ -61,28 +61,28 @@ void start_ptrace_monitor(pid_t child_pid) {
         }
         
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            if (pid == child_pid) break; // Main container shell exited
-            continue; // A sub-process exited, keep monitoring the rest
+            if (pid == child_pid) break; 
+            continue; 
         }
 
-        // If the process stopped for a non-syscall reason (e.g., new fork event), resume it
+        // Filter out non-syscall traps (like SIGSTOP or clone events)
         if (WSTOPSIG(status) != (SIGTRAP | 0x80)) {
             int sig = WSTOPSIG(status);
-            // Suppress ptrace-specific SIGTRAPs, but forward genuine kernel signals (like SIGCHLD)
-            int inject_sig = (sig == SIGTRAP) ? 0 : sig;
+            int inject_sig = (sig == SIGTRAP || sig == SIGSTOP) ? 0 : sig;
             ptrace(PTRACE_SYSCALL, pid, 0, inject_sig);
             continue;
         }
 
-        // Find or register PID state
         int p_idx = -1;
         for (int i = 0; i < pid_count; i++) {
             if (traced_pids[i] == pid) { p_idx = i; break; }
         }
+        
         if (p_idx == -1 && pid_count < 1024) {
             p_idx = pid_count++;
             traced_pids[p_idx] = pid;
-            in_syscall[p_idx] = 0;
+            // CORRECTED: The first 0x80 trap is guaranteed to be a SYSCALL ENTRY.
+            in_syscall[p_idx] = 0; 
         }
 
         if (p_idx != -1) {
@@ -95,20 +95,19 @@ void start_ptrace_monitor(pid_t child_pid) {
                 int points = 0;
                 char label[32] = "UNKNOWN";
 
-                if (orig_rax == SYS_openat || orig_rax == SYS_open) { points = 5; strcpy(label, "FILE_READ"); }
-                else if (orig_rax == SYS_write) { points = 10; strcpy(label, "FILE_WRITE"); }
+                // Record the exact time the syscall started
+                clock_gettime(CLOCK_MONOTONIC, &syscall_entry_time[p_idx]);
+
+                if (orig_rax == SYS_openat || orig_rax == SYS_open) { points = 1; strcpy(label, "FILE_OPEN"); }
+                else if (orig_rax == SYS_write) { points = 2; strcpy(label, "FILE_WRITE"); }
                 else if (orig_rax == SYS_unlink) { points = 20; strcpy(label, "FILE_DELETE"); }
-                else if (orig_rax == SYS_execve) { points = 30; strcpy(label, "EXEC"); }
+                else if (orig_rax == SYS_execve) { points = 10; strcpy(label, "EXEC"); }
                 else if (orig_rax == SYS_connect) { points = 50; strcpy(label, "NET_CONNECT"); }
                 else if (orig_rax == SYS_nanosleep || orig_rax == SYS_clock_nanosleep || orig_rax == SYS_pause) { 
                     strcpy(label, "SLEEP");
-                    points = 5; 
-                    final_stats.timebomb_flag = 1; 
-                    final_stats.sleep_ratio = 0.95; 
-                    total_sleep_usec += 1000000; 
+                    points = 2; 
                 }
 
-                // Only log suspicious events to save memory
                 if (points > 0 && event_count < MAX_EVENTS) {
                     final_stats.threat_score += points;
                     clock_gettime(CLOCK_MONOTONIC, &replay_log[event_count].timestamp);
@@ -118,21 +117,38 @@ void start_ptrace_monitor(pid_t child_pid) {
                     replay_log[event_count].tid = pid;
                     event_count++;
                 }
+            } else {
+                // === SYSCALL EXIT ===
+                struct user_regs_struct regs;
+                ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+                long orig_rax = regs.orig_rax;
+
+                // Calculate the exact elapsed time for sleep syscalls
+                if (orig_rax == SYS_nanosleep || orig_rax == SYS_clock_nanosleep || orig_rax == SYS_pause) {
+                    struct timespec exit_time;
+                    clock_gettime(CLOCK_MONOTONIC, &exit_time);
+                    
+                    long elapsed_usec = (exit_time.tv_sec - syscall_entry_time[p_idx].tv_sec) * 1000000 +
+                                        (exit_time.tv_nsec - syscall_entry_time[p_idx].tv_nsec) / 1000;
+                    
+                    if (elapsed_usec > 0) {
+                        total_sleep_usec += elapsed_usec;
+                    }
+                }
             }
             // Flip state between entry/exit so we only log once per syscall
             in_syscall[p_idx] = !in_syscall[p_idx];
         }
 
-        // Resume the specific process until its next syscall trap
         ptrace(PTRACE_SYSCALL, pid, 0, 0);
     }
 
     // Finalize Timing stats
-    // sleep_ratio = total_sleep_time / total_runtime
     double runtime_secs = get_elapsed_time();
     final_stats.sleep_ratio = (total_sleep_usec / 1e6) / (runtime_secs > 0 ? runtime_secs : 1);
     
-    if (final_stats.sleep_ratio > 0.70 && runtime_secs > 5) {
+    // Low-pass filter: Catch scripts that sleep heavily and run for > 1 sec
+    if (final_stats.sleep_ratio > 0.70 && runtime_secs > 1.0) {
         final_stats.timebomb_flag = 1;
     }
 }

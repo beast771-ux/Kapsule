@@ -7,14 +7,28 @@ ResourceStats final_stats = {0};
 
 void print_audit_report() {
     printf("\n╔════════════════════════════════════════════════════════════╗\n");
-    printf("║            KAPSULE FORENSIC AUDIT REPORT                  ║\n");
+    printf("║            KAPSULE FORENSIC AUDIT REPORT                   ║\n");
     printf("╠════════════════════════════════════════════════════════════╣\n");
     
-    // Verdict Logic [cite: 84]
-    if (final_stats.threat_score <= 20) strcpy(final_stats.verdict, "\033[0;32mCLEAN\033[0m");
-    else if (final_stats.threat_score <= 50) strcpy(final_stats.verdict, "\033[0;33mSUSPICIOUS\033[0m");
-    else if (final_stats.threat_score <= 100) strcpy(final_stats.verdict, "\033[0;31mHIGH RISK\033[0m");
+    // 1. Establish the base syscall verdict
+    if (final_stats.threat_score <= 50) strcpy(final_stats.verdict, "\033[0;32mCLEAN\033[0m");
+    else if (final_stats.threat_score <= 100) strcpy(final_stats.verdict, "\033[0;33mSUSPICIOUS\033[0m");
+    else if (final_stats.threat_score <= 150) strcpy(final_stats.verdict, "\033[0;31mHIGH RISK\033[0m");
     else strcpy(final_stats.verdict, "\033[1;31mMALICIOUS ☠\033[0m");
+
+    // 2. Apply Systemic Overrides without downgrading severe scores
+    if (final_stats.oom_killed) {
+        // OOM is always an immediate lethal threat
+        strcpy(final_stats.verdict, "\033[1;31mMALICIOUS ☠ (OOM TRIGGERED)\033[0m");
+    } else if (final_stats.timebomb_flag) {
+        if (final_stats.threat_score > 150) {
+            // Append the flag if it was already malicious
+            strcpy(final_stats.verdict, "\033[1;31mMALICIOUS ☠ (+TIMEBOMB)\033[0m");
+        } else {
+            // Upgrade to High Risk if the syscall score was low
+            strcpy(final_stats.verdict, "\033[0;31mHIGH RISK (TIMEBOMB)\033[0m");
+        }
+    }
 
     printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     printf(" FILESYSTEM CHANGES\n");
@@ -35,16 +49,15 @@ void print_audit_report() {
         printf("\n ⚠ TIME-BOMB PATTERN DETECTED (Sleep Ratio: %.0f%%)\n", final_stats.sleep_ratio * 100);
     }
 
-    // Conditional Replay Log 
-    if (final_stats.threat_score > 50 || final_stats.timebomb_flag) {
-        printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        printf(" REPLAY LOG [auto-triggered]\n");
-        printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        for (int i = 0; i < event_count; i++) {
-            printf(" pid=%d\t%-15s\t+%d pts\n", 
-                   replay_log[i].tid, replay_log[i].label, replay_log[i].threat_points);
-        }
+    // 3. Removed the conditional wrapper. Replay log prints unconditionally.
+    printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    printf(" REPLAY LOG\n");
+    printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    for (int i = 0; i < event_count; i++) {
+        printf(" pid=%d\t%-15s\t+%d pts\n", 
+               replay_log[i].tid, replay_log[i].label, replay_log[i].threat_points);
     }
+    if (event_count == 0) printf(" No significant syscalls traced.\n");
 
     printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     printf(" RESOURCE USAGE\n");
@@ -66,16 +79,8 @@ int main() {
         perror("clone failed"); exit(EXIT_FAILURE);
     }
 
-    // Move ONLY the child container process into the restricted cgroup [cite: 210]
-    char cgroup_path[PATH_MAX];
-    snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/unified/kapsule/cgroup.procs");
-    FILE *f = fopen(cgroup_path, "w");
-    if (f) {
-        fprintf(f, "%d", child_pid);
-        fclose(f);
-    }
+    add_pid_to_cgroup(child_pid);
 
-    // Parent orchestrates everything 
     start_ptrace_monitor(child_pid);
     audit_filesystem();
     read_cgroup_stats();
