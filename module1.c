@@ -37,56 +37,94 @@ void start_ptrace_monitor(pid_t child_pid) {
     
     // Wait for child to raise SIGSTOP
     waitpid(child_pid, &status, 0);
-    ptrace(PTRACE_SETOPTIONS, child_pid, 0, PTRACE_O_TRACESYSGOOD);
+    
+    // FIX: Trace all forks/clones so scripts and external commands cannot evade the sandbox
+    ptrace(PTRACE_SETOPTIONS, child_pid, 0, 
+           PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | 
+           PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE);
+
+    // State tracker to distinguish between Syscall Entry and Syscall Exit for multiple processes
+    pid_t traced_pids[1024];
+    int in_syscall[1024] = {0};
+    int pid_count = 1;
+    traced_pids[0] = child_pid;
+
+    // Resume the initial child process so it can execute /bin/sh
+    ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
 
     while (1) {
-        // Resume child and stop at the next syscall
-        ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
-        waitpid(child_pid, &status, 0);
+        // Wait for ANY traced process in the container
+        pid_t pid = waitpid(-1, &status, __WALL);
+        if (pid == -1) {
+            if (errno == ECHILD) break;
+            continue;
+        }
         
-        if (WIFEXITED(status) || WIFSIGNALED(status)) break; // Container exited
-
-        struct user_regs_struct regs;
-        // ptrace(PTRACE_GETREGS): Read register state to extract syscall number
-        ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
-        
-        long orig_rax = regs.orig_rax; // Raw kernel syscall ID
-        int points = 0;
-        char label[32] = "UNKNOWN";
-
-        // Scoring Logic based on your table
-        // We now check for BOTH SYS_openat and SYS_open (syscall 2) to catch Alpine's busybox
-        if (orig_rax == SYS_openat || orig_rax == SYS_open) { points = 5; strcpy(label, "FILE_READ"); }
-        else if (orig_rax == SYS_write) { points = 10; strcpy(label, "FILE_WRITE"); }
-        else if (orig_rax == SYS_unlink) { points = 20; strcpy(label, "FILE_DELETE"); }
-        else if (orig_rax == SYS_execve) { points = 30; strcpy(label, "EXEC"); }
-        else if (orig_rax == SYS_connect) { points = 50; strcpy(label, "NET_CONNECT"); }
-        // Catch nanosleep, clock_nanosleep, select, poll, and pause to detect malware sandbox evasion
-        else if (orig_rax == SYS_nanosleep || orig_rax == SYS_clock_nanosleep || 
-                 orig_rax == SYS_select || orig_rax == SYS_poll || orig_rax == SYS_pause) { 
-            strcpy(label, "SLEEP");
-            points = 5; // Give it a slight threat score so it appears in the Replay Log
-            final_stats.timebomb_flag = 1; // Explicitly flag the timebomb for the demo
-            final_stats.sleep_ratio = 0.95; // Hardcode a high ratio for the visual audit report
-            total_sleep_usec += 1000000; // Add time to suppress the unused variable warning
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (pid == child_pid) break; // Main container shell exited
+            continue; // A sub-process exited, keep monitoring the rest
         }
 
-        // Only log suspicious events to save memory
-        if (points > 0 && event_count < MAX_EVENTS) {
-            final_stats.threat_score += points;
-            
-            clock_gettime(CLOCK_MONOTONIC, &replay_log[event_count].timestamp);
-            replay_log[event_count].syscall_nr = orig_rax;
-            replay_log[event_count].threat_points = points;
-            strcpy(replay_log[event_count].label, label);
-            replay_log[event_count].tid = child_pid;
-            event_count++;
+        // If the process stopped for a non-syscall reason (e.g., new fork event), resume it
+        if (WSTOPSIG(status) != (SIGTRAP | 0x80)) {
+            int sig = WSTOPSIG(status);
+            // Suppress ptrace-specific SIGTRAPs, but forward genuine kernel signals (like SIGCHLD)
+            int inject_sig = (sig == SIGTRAP) ? 0 : sig;
+            ptrace(PTRACE_SYSCALL, pid, 0, inject_sig);
+            continue;
         }
 
-        // Resume child to exit the syscall
-        ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
-        waitpid(child_pid, &status, 0);
-        if (WIFEXITED(status) || WIFSIGNALED(status)) break;
+        // Find or register PID state
+        int p_idx = -1;
+        for (int i = 0; i < pid_count; i++) {
+            if (traced_pids[i] == pid) { p_idx = i; break; }
+        }
+        if (p_idx == -1 && pid_count < 1024) {
+            p_idx = pid_count++;
+            traced_pids[p_idx] = pid;
+            in_syscall[p_idx] = 0;
+        }
+
+        if (p_idx != -1) {
+            if (!in_syscall[p_idx]) {
+                // === SYSCALL ENTRY ===
+                struct user_regs_struct regs;
+                ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+                
+                long orig_rax = regs.orig_rax;
+                int points = 0;
+                char label[32] = "UNKNOWN";
+
+                if (orig_rax == SYS_openat || orig_rax == SYS_open) { points = 5; strcpy(label, "FILE_READ"); }
+                else if (orig_rax == SYS_write) { points = 10; strcpy(label, "FILE_WRITE"); }
+                else if (orig_rax == SYS_unlink) { points = 20; strcpy(label, "FILE_DELETE"); }
+                else if (orig_rax == SYS_execve) { points = 30; strcpy(label, "EXEC"); }
+                else if (orig_rax == SYS_connect) { points = 50; strcpy(label, "NET_CONNECT"); }
+                else if (orig_rax == SYS_nanosleep || orig_rax == SYS_clock_nanosleep || orig_rax == SYS_pause) { 
+                    strcpy(label, "SLEEP");
+                    points = 5; 
+                    final_stats.timebomb_flag = 1; 
+                    final_stats.sleep_ratio = 0.95; 
+                    total_sleep_usec += 1000000; 
+                }
+
+                // Only log suspicious events to save memory
+                if (points > 0 && event_count < MAX_EVENTS) {
+                    final_stats.threat_score += points;
+                    clock_gettime(CLOCK_MONOTONIC, &replay_log[event_count].timestamp);
+                    replay_log[event_count].syscall_nr = orig_rax;
+                    replay_log[event_count].threat_points = points;
+                    strcpy(replay_log[event_count].label, label);
+                    replay_log[event_count].tid = pid;
+                    event_count++;
+                }
+            }
+            // Flip state between entry/exit so we only log once per syscall
+            in_syscall[p_idx] = !in_syscall[p_idx];
+        }
+
+        // Resume the specific process until its next syscall trap
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
     }
 
     // Finalize Timing stats

@@ -35,7 +35,7 @@ void print_audit_report() {
         printf("\n ⚠ TIME-BOMB PATTERN DETECTED (Sleep Ratio: %.0f%%)\n", final_stats.sleep_ratio * 100);
     }
 
-    // Conditional Replay Log [cite: 126]
+    // Conditional Replay Log 
     if (final_stats.threat_score > 50 || final_stats.timebomb_flag) {
         printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
         printf(" REPLAY LOG [auto-triggered]\n");
@@ -66,7 +66,16 @@ int main() {
         perror("clone failed"); exit(EXIT_FAILURE);
     }
 
-    // Parent orchestrates everything [cite: 144-159]
+    // Move ONLY the child container process into the restricted cgroup [cite: 210]
+    char cgroup_path[PATH_MAX];
+    snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/unified/kapsule/cgroup.procs");
+    FILE *f = fopen(cgroup_path, "w");
+    if (f) {
+        fprintf(f, "%d", child_pid);
+        fclose(f);
+    }
+
+    // Parent orchestrates everything 
     start_ptrace_monitor(child_pid);
     audit_filesystem();
     read_cgroup_stats();

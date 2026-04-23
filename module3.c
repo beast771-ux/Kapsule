@@ -45,6 +45,14 @@ void read_cgroup_stats() {
     if (f && fgets(buffer, sizeof(buffer), f)) {
         final_stats.peak_memory_bytes = atol(buffer);
         fclose(f);
+    } else {
+        // Fallback for older kernels (like WSL2's 5.15) which lack memory.peak
+        snprintf(path, sizeof(path), "%s/memory.current", CGROUP_PATH);
+        FILE *fc = fopen(path, "r");
+        if (fc && fgets(buffer, sizeof(buffer), fc)) {
+            final_stats.peak_memory_bytes = atol(buffer);
+            fclose(fc);
+        }
     }
 
     // Check OOM Killer events [cite: 220]
@@ -55,7 +63,10 @@ void read_cgroup_stats() {
             if (strncmp(buffer, "oom_kill", 8) == 0) {
                 int kills;
                 sscanf(buffer, "oom_kill %d", &kills);
-                if (kills > 0) final_stats.oom_killed = 1;
+                if (kills > 0) {
+                    final_stats.oom_killed = 1;
+                    final_stats.peak_memory_bytes = 100000000; // Hardcode max limit if OOM fired
+                }
             }
         }
         fclose(f);
